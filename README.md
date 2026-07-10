@@ -1,5 +1,7 @@
 # s — 一个字母管住所有 SSH
 
+![s — 一个字母管住所有 SSH](banner.png)
+
 > A tiny SSH connection manager built on top of the standard `~/.ssh/config`.
 > One short alias to connect anything — keys or passwords, with auto-`sudo -i`, batch exec, port-forwarding and fzf picker.
 
