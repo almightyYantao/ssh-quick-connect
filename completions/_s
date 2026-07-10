@@ -1,0 +1,45 @@
+#compdef s
+# zsh 补全：s（SSH 连接管理器）
+#   s <tab>        → 列出子命令 + 所有主机别名
+#   s xbo<tab>     → 补全成 xboard-sni
+#   s rm <tab>     → 补全别名
+#   s cp <tab>     → 补全别名
+
+local -a subcmds hosts
+subcmds=(
+  'add:添加一台主机（密钥/密码）'
+  'rm:删除一台主机'
+  'cp:拷贝公钥升级为免密'
+  'passwd:修改密码登录主机的密码'
+  'desc:设置/修改主机描述'
+  'root:开关 登录后自动 sudo -i'
+  'set:改字段 host/user/port'
+  'put:上传文件'
+  'get:下载文件'
+  'ping:连通性检查'
+  'pick:fzf 模糊选机并连接'
+  'fwd:端口转发/隧道'
+  'run:批量执行命令'
+  'edit:编辑 ~/.ssh/config'
+  'ls:列出所有主机'
+)
+
+# 从 ~/.ssh/config 抓所有 Host 别名（排除含通配符的）
+hosts=(${(f)"$(awk '/^[[:space:]]*[Hh]ost[[:space:]]/ {for(i=2;i<=NF;i++) print $i}' ~/.ssh/config 2>/dev/null | grep -vE '[*?]')"})
+
+if (( CURRENT == 2 )); then
+  _describe -t hosts '主机' hosts
+  _describe -t commands '命令' subcmds
+elif [[ "$words[2]" == (ping) ]]; then
+  # ping 可跟多个别名/通配符
+  _describe -t hosts '主机' hosts
+elif (( CURRENT == 3 )); then
+  case "$words[2]" in
+    rm|del|remove|cp|copy-id|passwd|pw|desc|root|set|fwd|tunnel|forward|run|exec) _describe -t hosts '主机' hosts ;;
+    put|get|scp) _alternative "hosts:主机:(( ${^hosts}: ))" '文件:文件:_files' ;;
+  esac
+elif (( CURRENT == 4 )); then
+  case "$words[2]" in
+    set) compadd host user port ;;
+  esac
+fi
