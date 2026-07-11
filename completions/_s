@@ -11,17 +11,20 @@ subcmds=(
   'rm:删除一台主机'
   'cp:拷贝公钥升级为免密'
   'passwd:修改密码登录主机的密码'
-  'desc:设置/修改主机描述'
+  'desc:设置/修改主机描述（支持通配符批量）'
+  'group:设置/修改分组（支持通配符批量）'
   'root:开关 登录后自动 sudo -i'
-  'set:改字段 host/user/port'
+  'set:改字段 host/user/port/group/desc'
   'put:上传文件'
   'get:下载文件'
   'ping:连通性检查'
   'pick:fzf 模糊选机并连接'
   'fwd:端口转发/隧道'
   'run:批量执行命令'
+  'export:打包加密备份'
+  'import:从加密备份恢复'
   'edit:编辑 ~/.ssh/config'
-  'ls:列出所有主机'
+  'ls:列出所有主机（按分组）'
 )
 
 # 从 ~/.ssh/config 抓所有 Host 别名（排除含通配符的）
@@ -35,11 +38,12 @@ elif [[ "$words[2]" == (ping) ]]; then
   _describe -t hosts '主机' hosts
 elif (( CURRENT == 3 )); then
   case "$words[2]" in
-    rm|del|remove|cp|copy-id|passwd|pw|desc|root|set|fwd|tunnel|forward|run|exec) _describe -t hosts '主机' hosts ;;
+    rm|del|remove|cp|copy-id|passwd|pw|desc|group|grp|root|set|fwd|tunnel|forward|run|exec) _describe -t hosts '主机' hosts ;;
     put|get|scp) _alternative "hosts:主机:(( ${^hosts}: ))" '文件:文件:_files' ;;
+    import|restore) _files ;;
   esac
 elif (( CURRENT == 4 )); then
   case "$words[2]" in
-    set) compadd host user port ;;
+    set) compadd host user port group desc ;;
   esac
 fi

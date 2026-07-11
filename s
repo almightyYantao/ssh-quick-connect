@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # s — 极简 SSH 连接管理器（基于标准 ~/.ssh/config）
 #
-#   s                         列出所有主机
+#   s                         交互选择器：直接打机器名/IP 模糊搜索连，或选 ▸分组 浏览（fzf）
 #   s <别名>                  连接（自动判断密钥/密码登录）
 #   s add                     交互式添加一台主机（支持密钥 / 密码）
-#   s add <别名> <user@host> [-p PORT] [-i KEYFILE] [--pass] [-d "描述"]
+#   s add <别名> <user@host> [-p PORT] [-i KEYFILE] [--pass] [-d "描述"] [-g 组]
 #   s rm <别名>               删除一台主机（含 Keychain 里的密码）
-#   s set <别名> host|user|port <值>   快速改某个字段（云机 IP 变了很方便）
-#   s desc <别名> [描述…]     设置/修改描述（不带描述则清除）
+#   s set <别名/通配符> host|user|port|group|desc <值>   改字段（支持 lbc-* 批量）
+#   s desc <别名/通配符> [描述…]   设置/修改描述（留空则清除；支持批量）
+#   s group <别名/通配符> [组名]   设置/修改分组（留空则移出；支持 lbc-* 批量）
 #   s root <别名> [on|off]    开/关"登录后自动 sudo -i 切 root"（缺省=toggle）
 #   s passwd <别名>           修改密码登录主机在 Keychain 里的密码
 #   s put [-r] <本地…> <别名:路径>      上传文件（密码机自动走 sshpass）
@@ -16,9 +17,11 @@
 #   s pick                    fzf 模糊选机并连接
 #   s fwd <别名> <spec…>      端口转发，如 s fwd it-clickhouse-hk-01 8123
 #   s run <选择器> <命令…>    批量执行，如 s run 'it-iai-*' 'uptime'
-#   s ls                      同裸命令，列出所有主机
+#   s ls                      列出所有主机（按分组分区显示）
 #   s edit                    用 $EDITOR 打开 ~/.ssh/config
 #   s cp <别名>               把本机公钥拷到该主机（把密码登录升级成免密）
+#   s export [文件]           把所有主机+密码打成加密备份包（默认 ~/s-backup.enc）
+#   s import <文件>           在新机器上解密恢复（已存在的别名跳过，不覆盖）
 #
 # 说明：
 #   - 别名直接写进 ~/.ssh/config，所以原生 `ssh <别名>` 也能用。
@@ -33,8 +36,13 @@ KC_SERVICE="ssh-s-tool"
 # ---- 颜色 ----
 if [ -t 1 ]; then
   B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
+  # 霓虹真彩（HUD 科技感）：CY 青 / GN 绿 / AM 琥珀 / MG 品红 / RU 分隔线灰
+  CY=$'\033[38;2;60;235;235m'; GN=$'\033[38;2;120;245;150m'
+  AM=$'\033[38;2;245;190;90m'; MG=$'\033[38;2;255;90;170m'
+  RU=$'\033[38;2;70;95;110m'
 else
   B=""; G=""; Y=""; C=""; R=""; D=""; N=""
+  CY=""; GN=""; AM=""; MG=""; RU=""
 fi
 err()  { printf "%s✗%s %s\n" "$R" "$N" "$*" >&2; }
 info() { printf "%s•%s %s\n" "$C" "$N" "$*"; }
@@ -113,10 +121,60 @@ host_desc() { # $1=alias
   ' "$CONFIG" 2>/dev/null
 }
 
+# 取某别名的分组（可能为空）
+host_group() { # $1=alias
+  awk -v a="$1" '
+    /^[[:space:]]*[Hh]ost[[:space:]]/ {
+      inblk=0
+      for (i=2;i<=NF;i++) if ($i==a) inblk=1
+      next
+    }
+    inblk && $1=="#s-group" {
+      line=$0; sub(/^[[:space:]]*#s-group[[:space:]]*/,"",line); print line; exit
+    }
+  ' "$CONFIG" 2>/dev/null
+}
+
 # ---- Keychain ----
 kc_set() { security add-generic-password -U -s "$KC_SERVICE" -a "$1" -w "$2" >/dev/null 2>&1; }
-kc_get() { security find-generic-password -s "$KC_SERVICE" -a "$1" -w 2>/dev/null; }
+kc_get() { security find-generic-password -s "$KC_SERVICE" -a "$1" -w 2>/dev/null || true; }
 kc_del() { security delete-generic-password -s "$KC_SERVICE" -a "$1" >/dev/null 2>&1 || true; }
+
+# 打印单台主机的表格行（$1=别名）
+print_host_row() {
+  local alias="$1" local_host user port desc acolor aname roottag
+  local_host="$(host_field "$alias" HostName)"; [ -z "$local_host" ] && local_host="$alias"
+  user="$(host_field "$alias" User)"; [ -z "$user" ] && user="(默认)"
+  port="$(host_field "$alias" Port)"; [ -z "$port" ] && port="22"
+  desc="$(host_desc "$alias")"
+  if is_password_auth "$alias"; then acolor="$Y"; aname="密码"; else acolor="$G"; aname="密钥"; fi
+  roottag=""
+  is_auto_root "$alias" && roottag="${G}⇒root${N} "
+  printf "%s%s%s %s %s %s%s%s %b%s%s%s\n" \
+    "$C" "$(pad "$alias" 20)" "$N" \
+    "$(pad "${user}@${local_host}" 24)" \
+    "$(pad "$port" 6)" \
+    "$acolor" "$(pad "$aname" 6)" "$N" \
+    "$roottag" "$D" "$desc" "$N"
+}
+
+# 按出现顺序列出所有分组（无分组的主机归到末尾的“未分组”）
+all_groups() {
+  local a g
+  # 显式分组，按首次出现顺序去重
+  # 注意：本循环是管道左侧，循环体末句不能以求值为假的命令收尾，
+  # 否则 while 子 shell 退出码=1，配合 pipefail+set -e 会误杀整个函数，故用 if。
+  while IFS= read -r a; do
+    [ -z "$a" ] && continue
+    g="$(host_group "$a")"
+    if [ -n "$g" ]; then echo "$g"; fi
+  done < <(all_aliases) | awk '!seen[$0]++'
+  # 只要有一台没分组，就把“未分组”放最后（管道会开子 shell，故单独判断）
+  while IFS= read -r a; do
+    [ -z "$a" ] && continue
+    [ -z "$(host_group "$a")" ] && { echo "未分组"; break; }
+  done < <(all_aliases)
+}
 
 cmd_list() {
   ensure_config
@@ -124,27 +182,20 @@ cmd_list() {
     info "还没有任何主机，用 ${B}s add${N} 添加一台。"
     return 0
   fi
-  # 列宽（显示宽度）：别名16 目标24 端口6 登录6，描述为最后一列不补
-  printf "%s%s %s %s %s %s%s\n" "$B" \
-    "$(pad 别名 20)" "$(pad 目标 24)" "$(pad 端口 6)" "$(pad 登录 6)" "描述" "$N"
-  # 列出所有 Host 行的别名（跳过含通配符 * ? 的）
-  awk '/^[[:space:]]*[Hh]ost[[:space:]]/ { for (i=2;i<=NF;i++) print $i }' "$CONFIG" \
-    | grep -vE '[*?]' | while read -r alias; do
-      [ -z "$alias" ] && continue
-      local_host="$(host_field "$alias" HostName)"; [ -z "$local_host" ] && local_host="$alias"
-      user="$(host_field "$alias" User)"; [ -z "$user" ] && user="(默认)"
-      port="$(host_field "$alias" Port)"; [ -z "$port" ] && port="22"
-      desc="$(host_desc "$alias")"
-      if is_password_auth "$alias"; then acolor="$Y"; aname="密码"; else acolor="$G"; aname="密钥"; fi
-      local roottag=""
-      is_auto_root "$alias" && roottag="${G}⇒root${N} "
-      printf "%s%s%s %s %s %s%s%s %b%s%s%s\n" \
-        "$C" "$(pad "$alias" 20)" "$N" \
-        "$(pad "${user}@${local_host}" 24)" \
-        "$(pad "$port" 6)" \
-        "$acolor" "$(pad "$aname" 6)" "$N" \
-        "$roottag" "$D" "$desc" "$N"
-  done
+  local header
+  header="$(printf "%s%s %s %s %s %s%s" "$B" \
+    "$(pad 别名 20)" "$(pad 目标 24)" "$(pad 端口 6)" "$(pad 登录 6)" "描述" "$N")"
+  local g a hg first=1
+  while IFS= read -r g; do
+    [ -z "$g" ] && continue
+    printf "\n%s%s▊ %s%s\n" "$B" "$C" "$g" "$N"
+    printf "%s\n" "$header"
+    while IFS= read -r a; do
+      [ -z "$a" ] && continue
+      hg="$(host_group "$a")"; [ -z "$hg" ] && hg="未分组"
+      [ "$hg" = "$g" ] && print_host_row "$a"
+    done < <(all_aliases)
+  done < <(all_groups)
 }
 
 cmd_connect() { # $1=alias, 其余透传给 ssh
@@ -189,10 +240,11 @@ cmd_connect() { # $1=alias, 其余透传给 ssh
 }
 
 # 追加一个 Host 块到 config
-append_host() { # alias host user port keyfile is_pass desc auto_root
-  local alias="$1" host="$2" user="$3" port="$4" keyfile="$5" is_pass="$6" desc="${7:-}" auto_root="${8:-0}"
+append_host() { # alias host user port keyfile is_pass desc auto_root group
+  local alias="$1" host="$2" user="$3" port="$4" keyfile="$5" is_pass="$6" desc="${7:-}" auto_root="${8:-0}" group="${9:-}"
   {
     printf "\nHost %s\n" "$alias"
+    [ -n "$group" ] && printf "  #s-group %s\n" "$group"
     [ -n "$desc" ] && printf "  #s-desc %s\n" "$desc"
     [ "$auto_root" = "1" ] && printf "  #s-root yes\n"
     printf "  HostName %s\n" "$host"
@@ -210,9 +262,9 @@ append_host() { # alias host user port keyfile is_pass desc auto_root
 
 cmd_add() {
   ensure_config
-  local alias="" target="" user="" host="" port="22" keyfile="" is_pass=0 desc="" auto_root=0
+  local alias="" target="" user="" host="" port="22" keyfile="" is_pass=0 desc="" auto_root=0 group=""
 
-  # 非交互：s add <别名> <user@host> [-p PORT] [-i KEY] [--pass] [-d "描述"] [--root]
+  # 非交互：s add <别名> <user@host> [-p PORT] [-i KEY] [--pass] [-d "描述"] [-g 组]
   if [ $# -ge 2 ]; then
     alias="$1"; target="$2"; shift 2
     if [[ "$target" == *@* ]]; then user="${target%@*}"; host="${target#*@}"; else host="$target"; fi
@@ -222,6 +274,7 @@ cmd_add() {
         -i|--identity) keyfile="$2"; shift 2 ;;
         --pass|--password) is_pass=1; shift ;;
         -d|--desc|--description) desc="$2"; shift 2 ;;
+        -g|--group) group="$2"; shift 2 ;;
         --root) auto_root=1; shift ;;
         *) err "未知参数: $1"; exit 1 ;;
       esac
@@ -234,6 +287,7 @@ cmd_add() {
     [ -z "$host" ] && { err "主机不能为空"; exit 1; }
     printf "%s用户%s [root]: " "$B" "$N"; read -r user; [ -z "$user" ] && user="root"
     printf "%s端口%s [22]: " "$B" "$N"; read -r port; [ -z "$port" ] && port="22"
+    printf "%s分组%s (可留空，如 生产/测试/香港): " "$B" "$N"; read -r group
     printf "%s描述%s (可留空): " "$B" "$N"; read -r desc
     printf "%s登录方式%s  1) 密钥(默认)  2) 密码 : " "$B" "$N"; read -r m
     if [ "$m" = "2" ]; then
@@ -257,7 +311,7 @@ cmd_add() {
     [ -z "$pw" ] && { err "密码不能为空"; exit 1; }
   fi
 
-  append_host "$alias" "$host" "$user" "$port" "$keyfile" "$is_pass" "$desc" "$auto_root"
+  append_host "$alias" "$host" "$user" "$port" "$keyfile" "$is_pass" "$desc" "$auto_root" "$group"
   [ "$is_pass" = "1" ] && kc_set "$alias" "$pw"
 
   echo
@@ -324,29 +378,66 @@ cmd_passwd() { # 更新某别名在 Keychain 里的密码
   printf "%s✓%s 已更新 %s%s%s 的密码\n" "$G" "$N" "$C" "$alias" "$N"
 }
 
-cmd_desc() { # 设置/修改/清除某别名的描述：s desc <别名> [描述文本…]
+cmd_desc() { # 设置/修改/清除描述：s desc <别名/通配符> [描述…]（支持 lbc-* 或 a,b,c 批量）
   ensure_config
-  local alias="${1:-}"; shift || true
-  [ -z "$alias" ] && { err "用法：s desc <别名> <描述>（描述留空则清除）"; exit 1; }
-  if ! host_exists "$alias"; then err "未找到别名：$alias"; exit 1; fi
+  local sel="${1:-}"; shift || true
+  [ -z "$sel" ] && { err "用法：s desc <别名/通配符> <描述>（描述留空则清除）"; exit 1; }
   local desc="$*"
-  local tmp; tmp="$(mktemp)"
-  awk -v a="$alias" -v d="$desc" '
-    /^[[:space:]]*[Hh]ost[[:space:]]/ {
-      intgt = (NF==2 && $2==a) ? 1 : 0
-      print
-      if (intgt && d!="") print "  #s-desc " d
-      next
-    }
-    intgt && $1=="#s-desc" { next }   # 丢掉目标块里的旧描述行
-    { print }
-  ' "$CONFIG" >"$tmp"
-  mv "$tmp" "$CONFIG"; chmod 600 "$CONFIG" 2>/dev/null || true
-  if [ -n "$desc" ]; then
-    printf "%s✓%s %s%s%s 的描述：%s\n" "$G" "$N" "$C" "$alias" "$N" "$desc"
-  else
-    printf "%s✓%s 已清除 %s%s%s 的描述\n" "$G" "$N" "$C" "$alias" "$N"
-  fi
+  local -a targets=(); local a
+  while IFS= read -r a; do [ -n "$a" ] && targets+=("$a"); done < <(expand_selector "$sel")
+  [ ${#targets[@]} -eq 0 ] && exit 1   # expand_aliases 已逐个报过"没有匹配"，此处静默退出
+  local tmp alias
+  for alias in "${targets[@]}"; do
+    tmp="$(mktemp)"
+    awk -v a="$alias" -v d="$desc" '
+      /^[[:space:]]*[Hh]ost[[:space:]]/ {
+        intgt = (NF==2 && $2==a) ? 1 : 0
+        print
+        if (intgt && d!="") print "  #s-desc " d
+        next
+      }
+      intgt && $1=="#s-desc" { next }   # 丢掉目标块里的旧描述行
+      { print }
+    ' "$CONFIG" >"$tmp"
+    mv "$tmp" "$CONFIG"
+    if [ -n "$desc" ]; then
+      printf "%s✓%s %s%s%s 的描述：%s\n" "$G" "$N" "$C" "$alias" "$N" "$desc"
+    else
+      printf "%s✓%s 已清除 %s%s%s 的描述\n" "$G" "$N" "$C" "$alias" "$N"
+    fi
+  done
+  chmod 600 "$CONFIG" 2>/dev/null || true
+}
+
+cmd_group() { # 设置/修改/清除分组：s group <别名/通配符> [组名]（支持 lbc-* 或 a,b,c 批量）
+  ensure_config
+  local sel="${1:-}"; shift || true
+  [ -z "$sel" ] && { err "用法：s group <别名/通配符> <组名>（组名留空则移出分组）"; exit 1; }
+  local group="$*"
+  local -a targets=(); local a
+  while IFS= read -r a; do [ -n "$a" ] && targets+=("$a"); done < <(expand_selector "$sel")
+  [ ${#targets[@]} -eq 0 ] && exit 1   # expand_aliases 已逐个报过"没有匹配"，此处静默退出
+  local tmp alias
+  for alias in "${targets[@]}"; do
+    tmp="$(mktemp)"
+    awk -v a="$alias" -v g="$group" '
+      /^[[:space:]]*[Hh]ost[[:space:]]/ {
+        intgt = (NF==2 && $2==a) ? 1 : 0
+        print
+        if (intgt && g!="") print "  #s-group " g
+        next
+      }
+      intgt && $1=="#s-group" { next }   # 丢掉目标块里的旧分组行
+      { print }
+    ' "$CONFIG" >"$tmp"
+    mv "$tmp" "$CONFIG"
+    if [ -n "$group" ]; then
+      printf "%s✓%s %s%s%s 归入分组：%s\n" "$G" "$N" "$C" "$alias" "$N" "$group"
+    else
+      printf "%s✓%s 已把 %s%s%s 移出分组\n" "$G" "$N" "$C" "$alias" "$N"
+    fi
+  done
+  chmod 600 "$CONFIG" 2>/dev/null || true
 }
 
 cmd_root() { # 开/关"登录后自动 sudo -i"：s root <别名> [on|off]，缺省=toggle
@@ -403,33 +494,45 @@ cmd_scp() {
   fi
 }
 
-# 修改某别名的字段：s set <别名> <host|user|port> <值>
+# 修改字段：s set <别名/通配符> <host|user|port|group|desc> <值>（支持 lbc-* 或 a,b,c 批量）
 cmd_set() {
   ensure_config
-  local alias="${1:-}" field="${2:-}" value="${3:-}"
-  [ -z "$alias" ] || [ -z "$field" ] || [ -z "$value" ] && { err "用法：s set <别名> <host|user|port> <值>"; exit 1; }
-  if ! host_exists "$alias"; then err "未找到别名：$alias"; exit 1; fi
+  local sel="${1:-}" field="${2:-}"; shift 2 2>/dev/null || true
+  local value="$*"
+  [ -z "$sel" ] || [ -z "$field" ] || [ -z "$value" ] && { err "用法：s set <别名/通配符> <host|user|port|group|desc> <值>"; exit 1; }
+  # group/desc 本质是注释标记，直接复用现成命令（它们自己会展开选择器）
+  case "$field" in
+    group|grp|组)   cmd_group "$sel" "$value"; return ;;
+    desc|描述|note) cmd_desc "$sel" "$value"; return ;;
+  esac
   local directive
   case "$field" in
     host|hostname|ip|HostName) directive="HostName" ;;
     user|User)                 directive="User" ;;
     port|Port)                 directive="Port" ;;
-    *) err "字段只能是 host / user / port"; exit 1 ;;
+    *) err "字段只能是 host / user / port / group / desc"; exit 1 ;;
   esac
-  local tmp; tmp="$(mktemp)"
-  awk -v a="$alias" -v d="$directive" -v v="$value" '
-    BEGIN { dl=tolower(d) }
-    /^[[:space:]]*[Hh]ost[[:space:]]/ {
-      intgt = (NF==2 && $2==a) ? 1 : 0
-      print
-      if (intgt) print "  " d " " v
-      next
-    }
-    intgt && tolower($1)==dl { next }   # 丢掉目标块里的旧值
-    { print }
-  ' "$CONFIG" >"$tmp"
-  mv "$tmp" "$CONFIG"; chmod 600 "$CONFIG" 2>/dev/null || true
-  printf "%s✓%s %s%s%s 的 %s 已设为 %s\n" "$G" "$N" "$C" "$alias" "$N" "$directive" "$value"
+  local -a targets=(); local a
+  while IFS= read -r a; do [ -n "$a" ] && targets+=("$a"); done < <(expand_selector "$sel")
+  [ ${#targets[@]} -eq 0 ] && exit 1   # expand_aliases 已逐个报过"没有匹配"，此处静默退出
+  local tmp alias
+  for alias in "${targets[@]}"; do
+    tmp="$(mktemp)"
+    awk -v a="$alias" -v d="$directive" -v v="$value" '
+      BEGIN { dl=tolower(d) }
+      /^[[:space:]]*[Hh]ost[[:space:]]/ {
+        intgt = (NF==2 && $2==a) ? 1 : 0
+        print
+        if (intgt) print "  " d " " v
+        next
+      }
+      intgt && tolower($1)==dl { next }   # 丢掉目标块里的旧值
+      { print }
+    ' "$CONFIG" >"$tmp"
+    mv "$tmp" "$CONFIG"
+    printf "%s✓%s %s%s%s 的 %s 已设为 %s\n" "$G" "$N" "$C" "$alias" "$N" "$directive" "$value"
+  done
+  chmod 600 "$CONFIG" 2>/dev/null || true
 }
 
 # 所有别名（一行一个）
@@ -452,6 +555,12 @@ expand_aliases() {
   # 去重并保持顺序（空数组在 bash3.2+set -u 下要用 +扩展 兜底）
   [ ${#out[@]} -eq 0 ] && return 0
   printf "%s\n" "${out[@]}" | awk '!seen[$0]++'
+}
+
+# 把选择器（支持通配符 lbc-* 和逗号 a,b,c）展开成实际别名列表（逐行）
+expand_selector() { # $1=选择器
+  local -a pats=(); local IFS_OLD="$IFS"; IFS=','; read -ra pats <<< "$1"; IFS="$IFS_OLD"
+  expand_aliases "${pats[@]}"
 }
 
 # 连通性检查：s ping [别名/通配符…]（不带参数=全部）
@@ -482,10 +591,102 @@ cmd_pick() {
   line="$(all_aliases | while IFS= read -r a; do
       [ -z "$a" ] && continue
       printf "%s\t%s@%s\t%s\n" "$a" "$(host_field "$a" User)" "$(host_field "$a" HostName)" "$(host_desc "$a")"
-    done | column -t -s $'\t' | fzf --height=40% --reverse --prompt='ssh> ' --header='选机器回车连接（Esc 取消）')"
+    done | column -t -s $'\t' | fzf --height=40% --reverse --prompt='ssh> ' --header='选机器回车连接（Esc 取消）' || true)"
   [ -z "$line" ] && exit 0
   alias="${line%% *}"
   cmd_connect "$alias"
+}
+
+# 列出某分组下的别名（$1="全部主机"=全部；"未分组"=没有分组标记的；其它=该组）
+hosts_in_group() {
+  local want="$1" a g
+  while IFS= read -r a; do
+    [ -z "$a" ] && continue
+    if [ "$want" = "全部主机" ]; then echo "$a"; continue; fi
+    g="$(host_group "$a")"; [ -z "$g" ] && g="未分组"
+    if [ "$g" = "$want" ]; then echo "$a"; fi   # 用 if：本函数常作管道左侧，见 all_groups 注释
+  done < <(all_aliases)
+}
+
+# 统一的 fzf 样式（无边框/无分隔线，尽量清爽；青色指针+高亮）
+_FZF() {
+  # 高度约 24 行（含提示/表头）≈ 一页 20 台，多了自动滚动翻页；霓虹 HUD 配色
+  fzf --ansi --layout=reverse --height=24 --scroll-off=2 \
+      --no-separator --border=none --info=inline \
+      --pointer='▶' --prompt='◤ ' \
+      --color='bg:-1,bg+:-1,fg:#8aa0aa,fg+:#e8fbff,hl:#7ef28a,hl+:#39ff14,pointer:#38ebeb,prompt:#38ebeb,marker:#ff5aaa,info:#4a5560,header:#4a5560,gutter:-1' \
+      "$@"
+}
+
+# 机器行（缩进挂在分组标题下）。别名霓虹着色（青=密钥/琥珀=密码），目标灰，描述更暗。
+# 不加行首符号，避免整列连成竖条。
+menu_host_row() {
+  local a="$1" u h d ac
+  u="$(host_field "$a" User)"; [ -z "$u" ] && u="(默认)"
+  h="$(host_field "$a" HostName)"; [ -z "$h" ] && h="$a"
+  d="$(host_desc "$a")"
+  if is_password_auth "$a"; then ac="$AM"; else ac="$CY"; fi
+  printf 'H\t%s\t    %s%s%s %s%s%s %s%s%s\n' \
+    "$a" "$ac" "$(pad "$a" 18)" "$N" "$RU" "$(pad "${u}@${h}" 26)" "$N" "$D" "$d" "$N"
+}
+
+# 分组标题行（HUD 风）：大写霓虹组名 + 横向填充线 ── 补到定宽 + 暗色台数。
+# 横线是水平的，不会像竖条那样碍眼。
+menu_group_header() {
+  local g="$1" cnt name w rule
+  cnt="$(hosts_in_group "$g" | grep -c . || true)"
+  name="$(printf '%s' "$g" | tr '[:lower:]' '[:upper:]')"
+  w=$(( 44 - $(dwidth "$name") )); (( w < 2 )) && w=2
+  rule="$(printf '%*s' "$w" '' | tr ' ' '─')"
+  printf 'G\t%s\t%s%s%s %s%s%s %s%s台%s\n' \
+    "$g" "$B$CY" "$name" "$N" "$RU" "$rule" "$N" "$D" "$cnt" "$N"
+}
+
+# 展开的分组树：分组标题 + 缩进机器，全部显示（供 fzf 模糊过滤/滚动翻页）
+menu_tree() {
+  local g a
+  while IFS= read -r g; do
+    [ -z "$g" ] && continue
+    menu_group_header "$g"
+    while IFS= read -r a; do
+      [ -z "$a" ] && continue
+      menu_host_row "$a"
+    done < <(hosts_in_group "$g")
+  done < <(all_groups)
+}
+
+# 从 fzf 选中的一行里取出别名（第 2 个 tab 字段）
+_sel_alias() { local s="${1#*$'\t'}"; printf '%s' "${s%%$'\t'*}"; }
+
+# 交互选择入口（裸 s）：展开的分组树，全部显示；打字模糊过滤，↑↓/PgUp·PgDn 翻页。
+# 回车落在机器上=直接连；落在分组标题上=只看该组（Esc 返回）。窗口高度受限，超出即滚动。
+cmd_menu() {
+  ensure_config
+  if ! grep -qE '^[[:space:]]*[Hh]ost[[:space:]]' "$CONFIG" 2>/dev/null; then
+    info "还没有任何主机，用 ${B}s add${N} 添加一台。"; return 0
+  fi
+  # 没有 fzf 或非交互终端时，退回普通列表
+  if ! command -v fzf >/dev/null 2>&1 || [ ! -t 0 ] || [ ! -t 1 ]; then
+    cmd_list; return 0
+  fi
+  local sel type key alias
+  while true; do
+    clear
+    sel="$( menu_tree | _FZF --delimiter='\t' --with-nth=3.. \
+              --header='⌁ 打字 过滤　↵ 连接/展开　⇅ PgDn 翻页　⎋ 退出' \
+              || true )"
+    [ -z "$sel" ] && exit 0
+    type="${sel%%$'\t'*}"; key="$(_sel_alias "$sel")"
+    if [ "$type" = "H" ]; then
+      cmd_connect "$key"; break
+    fi
+    # 回车落在分组标题 → 只看该组机器（Esc 返回）
+    sel="$( while IFS= read -r a; do [ -n "$a" ] && menu_host_row "$a"; done < <(hosts_in_group "$key") \
+            | _FZF --delimiter='\t' --with-nth=3.. --prompt="◤ ${key} ▶ " \
+                   --header='↵ 连接　⎋ 返回上一层' || true )"
+    [ -z "$sel" ] && continue
+    cmd_connect "$(_sel_alias "$sel")"; break
+  done
 }
 
 # 端口转发：s fwd <别名> <spec…>；spec = 本地:远端主机:远端口，或简写 端口(=端口:localhost:端口)
@@ -544,17 +745,143 @@ cmd_run() {
 
 cmd_edit() { ensure_config; "${EDITOR:-vi}" "$CONFIG"; }
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+# 从指定文件里抽出某别名的完整 Host 块（$1=文件 $2=别名）
+block_of() {
+  awk -v a="$2" '
+    /^[[:space:]]*[Hh]ost[[:space:]]/ {
+      if (inblk) exit                       # 遇到下一个 Host 行就停
+      inblk = (NF==2 && $2==a) ? 1 : 0
+    }
+    inblk { print }
+  ' "$1" 2>/dev/null
+}
+
+# 列出某文件里所有非通配符别名（$1=文件）
+aliases_of() {
+  awk '/^[[:space:]]*[Hh]ost[[:space:]]/ { for (i=2;i<=NF;i++) print $i }' "$1" 2>/dev/null | grep -vE '[*?]'
+}
+
+# 读一个口令（可选二次确认）：结果写到全局 __PASS
+read_pass() { # $1=提示 $2=confirm(1/0)
+  local p1 p2
+  printf "%s%s%s: " "$B" "$1" "$N" >&2; read -rs p1; echo >&2
+  [ -z "$p1" ] && { err "口令不能为空"; exit 1; }
+  if [ "${2:-0}" = "1" ]; then
+    printf "%s再输一次确认%s: " "$B" "$N" >&2; read -rs p2; echo >&2
+    [ "$p1" != "$p2" ] && { err "两次输入不一致"; exit 1; }
+  fi
+  __PASS="$p1"
+}
+
+# s export [文件]：把所有 s 管的主机块 + Keychain 密码打成一个加密备份包
+cmd_export() {
+  ensure_config
+  local out="${1:-$HOME/s-backup.enc}"
+  local plain; plain="$(mktemp)"
+  local n_host=0 n_pass=0 alias pw
+  {
+    printf "#S-BACKUP v1\n"
+    printf "#S-CONFIG-BEGIN\n"
+    while IFS= read -r alias; do
+      [ -z "$alias" ] && continue
+      block_of "$CONFIG" "$alias"
+      printf "\n"
+      n_host=$((n_host+1))
+    done < <(all_aliases)
+    printf "#S-CONFIG-END\n"
+    printf "#S-PASS-BEGIN\n"
+    while IFS= read -r alias; do
+      [ -z "$alias" ] && continue
+      is_password_auth "$alias" || continue
+      pw="$(kc_get "$alias")"
+      [ -z "$pw" ] && continue
+      printf "%s\t%s\n" "$alias" "$(printf '%s' "$pw" | base64 | tr -d '\n')"
+      n_pass=$((n_pass+1))
+    done < <(all_aliases)
+    printf "#S-PASS-END\n"
+  } >"$plain"
+
+  if [ "$n_host" -eq 0 ]; then
+    rm -f "$plain"; err "没有可导出的主机。"; exit 1
+  fi
+
+  local __PASS; read_pass "设置备份口令（恢复时要用，请记牢）" 1
+  # 口令走进程替换的 fd，不进 argv / 环境变量
+  if ! openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+        -in "$plain" -out "$out" -pass file:<(printf '%s' "$__PASS"); then
+    rm -f "$plain"; err "加密失败。"; exit 1
+  fi
+  rm -f "$plain"
+  chmod 600 "$out" 2>/dev/null || true
+  printf "%s✓%s 已导出 %d 台主机（其中 %d 台含密码）→ %s%s%s\n" \
+    "$G" "$N" "$n_host" "$n_pass" "$C" "$out" "$N"
+  printf "  这个文件+口令=全部服务器凭据，请妥善保管。恢复：%ss import %s%s\n" "$B" "$out" "$N"
+}
+
+# s import <文件>：解密恢复主机块（已存在别名跳过）+ 写回 Keychain 密码
+cmd_import() {
+  ensure_config
+  local in="${1:-}"
+  [ -z "$in" ] && { err "用法：s import <备份文件>"; exit 1; }
+  [ -f "$in" ] || { err "文件不存在：$in"; exit 1; }
+
+  local __PASS; read_pass "输入备份口令" 0
+  local plain; plain="$(mktemp)"
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -in "$in" -out "$plain" -pass file:<(printf '%s' "$__PASS") 2>/dev/null; then
+    rm -f "$plain"; err "解密失败（口令错误或文件损坏）。"; exit 1
+  fi
+  if [ "$(head -1 "$plain")" != "#S-BACKUP v1" ]; then
+    rm -f "$plain"; err "不是有效的 s 备份文件。"; exit 1
+  fi
+
+  # 拆出 config 段和 pass 段
+  local cfg pass; cfg="$(mktemp)"; pass="$(mktemp)"
+  awk '/^#S-CONFIG-BEGIN$/{c=1;next} /^#S-CONFIG-END$/{c=0} c' "$plain" >"$cfg"
+  awk '/^#S-PASS-BEGIN$/{p=1;next} /^#S-PASS-END$/{p=0} p' "$plain" >"$pass"
+  rm -f "$plain"
+
+  local added=0 skipped=0 alias
+  while IFS= read -r alias; do
+    [ -z "$alias" ] && continue
+    if host_exists "$alias"; then
+      info "跳过已存在别名：$alias"; skipped=$((skipped+1)); continue
+    fi
+    { printf "\n"; block_of "$cfg" "$alias"; } >>"$CONFIG"
+    added=$((added+1))
+  done < <(aliases_of "$cfg")
+  chmod 600 "$CONFIG" 2>/dev/null || true
+
+  # 只给这次真正新增的别名写回密码（已存在的不动其 Keychain）
+  local n_pw=0 b64 pw
+  while IFS=$'\t' read -r alias b64; do
+    [ -z "$alias" ] && continue
+    host_exists "$alias" || continue
+    is_password_auth "$alias" || continue
+    kc_get "$alias" >/dev/null 2>&1 && continue   # 本机已有密码就不覆盖
+    pw="$(printf '%s' "$b64" | base64 -d 2>/dev/null || true)"
+    [ -z "$pw" ] && continue
+    kc_set "$alias" "$pw"; n_pw=$((n_pw+1))
+  done <"$pass"
+  rm -f "$cfg" "$pass"
+
+  printf "%s✓%s 导入完成：新增 %s%d%s 台，跳过 %d 台，写回密码 %d 条\n" \
+    "$G" "$N" "$G" "$added" "$N" "$skipped" "$n_pw"
+}
+
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
-  local cmd="${1:-ls}"
+  local cmd="${1:-menu}"
   case "$cmd" in
+    menu)      cmd_menu ;;
     ls|list)   cmd_list ;;
     add)       shift; cmd_add "$@" ;;
     rm|del|remove) shift; cmd_rm "$@" ;;
     cp|copy-id)    shift; cmd_cp "$@" ;;
     passwd|pw) shift; cmd_passwd "$@" ;;
     desc)      shift; cmd_desc "$@" ;;
+    group|grp) shift; cmd_group "$@" ;;
     root)      shift; cmd_root "$@" ;;
     put|get|scp) shift; cmd_scp "$@" ;;
     set)       shift; cmd_set "$@" ;;
@@ -563,8 +890,10 @@ main() {
     fwd|tunnel|forward) shift; cmd_fwd "$@" ;;
     run|exec)  shift; cmd_run "$@" ;;
     edit)      cmd_edit ;;
+    export|backup)  shift; cmd_export "$@" ;;
+    import|restore) shift; cmd_import "$@" ;;
     -h|--help|help) usage ;;
-    "")        cmd_list ;;
+    "")        cmd_menu ;;
     *)         cmd_connect "$@" ;;  # 其它一律当别名连接
   esac
 }
